@@ -57,7 +57,8 @@ Edit `.env` before starting the container:
 | Variable | Purpose |
 | --- | --- |
 | `GROQ_API_KEY` | Optional Groq key. AI requests require it. Never commit your `.env`. |
-| `GROQ_MODEL` | Default: `llama-3.3-70b-versatile`. Change it if the model is unavailable to your account. |
+| `GROQ_MODEL` | Default: `openai/gpt-oss-120b`. Change it if the model is unavailable to your account. |
+| `GROQ_MAX_TOKENS` | Token limit for **Normal** responses. Default: `400`. |
 | `APP_USERNAME`, `APP_PASSWORD` | Optional login; set both to enable it. |
 | `SECRET_KEY` | Random secret for signed login cookies. Required when login is enabled. |
 | `DATABASE_PATH` | Default: `/app/data/gym.db`. |
@@ -73,6 +74,8 @@ Port `8085` on your host maps to `8000` in the container. Change the left side o
 3. Click **Send to AI**. This is the only action that requests a generated answer from Groq.
 
 The **Test Groq** button makes an explicit connectivity request but does not generate an answer. A matching question, context, and model can reuse a cached response. Check **Generate new response** to bypass the cache. The AI is not a substitute for medical or physiotherapy advice.
+
+In **Settings**, choose **Short** (default: 250 completion tokens, about 150 words), **Normal** (400 tokens by default, about 250 words), or **Detailed** (900 tokens, about 600 words). Asking for a detailed analysis temporarily selects Detailed for that question. These are upper bounds, not targets; the response may be shorter. GPT-OSS uses low reasoning effort to conserve its completion-token budget. The cache includes the selected size, so older long answers are not reused. Questions naming a single weekday send only that day's plan; questions about a named exercise's progression send only its recent history. The context preview updates as you type without calling Groq.
 
 ## Backups
 

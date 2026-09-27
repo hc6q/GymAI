@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
 from contextlib import contextmanager
@@ -10,6 +11,8 @@ from pathlib import Path
 from typing import Literal
 
 import httpx
+import bleach
+import markdown
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -24,7 +27,11 @@ PASSWORD = os.getenv('APP_PASSWORD', '')
 AUTH = bool(USER and PASSWORD)
 if AUTH and (not KEY or KEY == 'CHANGE_ME_TO_A_LONG_RANDOM_VALUE'):
     raise RuntimeError('Configure SECRET_KEY com um valor aleatório antes de ativar o login')
-MODEL = os.getenv('GROQ_MODEL') or 'llama-3.3-70b-versatile'
+MODEL = os.getenv('GROQ_MODEL') or 'openai/gpt-oss-120b'
+NORMAL_MAX_TOKENS = int(os.getenv('GROQ_MAX_TOKENS', '400'))
+if not 50 <= NORMAL_MAX_TOKENS <= 4000:
+    raise RuntimeError('GROQ_MAX_TOKENS deve estar entre 50 e 4000')
+RESPONSE_LIMITS = {'short': 250, 'normal': NORMAL_MAX_TOKENS, 'detailed': 900}
 DAYS = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo']
 DEFAULTS = [('Supino reto','Peito','Barra'),('Supino inclinado','Peito','Halteres'),('Crucifixo','Peito','Halteres'),('Desenvolvimento','Ombros','Halteres'),('Elevação lateral','Ombros','Halteres'),('Rosca direta','Bíceps','Barra'),('Rosca martelo','Bíceps','Halteres'),('Tríceps corda','Tríceps','Polia'),('Tríceps francês','Tríceps','Halteres'),('Barra fixa','Costas','Barra'),('Puxada alta','Costas','Polia'),('Remada baixa','Costas','Polia'),('Remada curvada','Costas','Barra'),('Agachamento','Pernas','Barra'),('Leg press','Pernas','Máquina'),('Extensora','Quadríceps','Máquina'),('Flexora','Posterior','Máquina'),('Panturrilha','Panturrilha','Máquina'),('Levantamento terra','Posterior','Barra'),('Stiff','Posterior','Barra')]
 SCHEMA = '''
@@ -37,6 +44,7 @@ CREATE TABLE IF NOT EXISTS session_sets(id INTEGER PRIMARY KEY, session_id INTEG
 CREATE TABLE IF NOT EXISTS ai_requests(id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, model TEXT NOT NULL, question TEXT NOT NULL, context_hash TEXT NOT NULL, prompt_tokens INTEGER DEFAULT 0, completion_tokens INTEGER DEFAULT 0, total_tokens INTEGER DEFAULT 0, cached INTEGER NOT NULL DEFAULT 0, response TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS ix_history ON session_sets(exercise_id,session_id);
 CREATE INDEX IF NOT EXISTS ix_ai_hash ON ai_requests(context_hash,cached);
+CREATE TABLE IF NOT EXISTS app_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 '''
 
 def now(): return datetime.now(timezone.utc).isoformat()
@@ -285,7 +293,58 @@ def progress(eid:int):
         h=rows(c.execute('SELECT s.performed_at,ss.weight,ss.reps,ss.unit FROM session_sets ss JOIN workout_sessions s ON s.id=ss.session_id WHERE ss.exercise_id=? ORDER BY s.performed_at DESC,s.id DESC,ss.set_number DESC LIMIT 100',(eid,)))
         return {'exercise':e,'last':h[0] if h else None,'max_weight':max((x['weight'] for x in h),default=None),'recent':h}
 
-SYSTEM='Você é um assistente de treino de musculação. Analise volume, divisão, progressão e exercícios. Dê sugestões práticas com motivos. Não invente dados. Quando faltar informação, diga o que falta. Evite mudanças apenas por mudar. Se houver dor, lesão ou sintomas importantes, recomende avaliação profissional.'
+SYSTEM='''Você é um assistente de musculação integrado a um aplicativo pessoal.
+Responda SOMENTE ao que o usuário perguntou. Seja curto e objetivo por padrão.
+REGRAS:
+- Para perguntas simples, prefira menos de 100 palavras.
+- Não faça análise completa da rotina se não for solicitada.
+- Não repita o treino enviado no contexto nem crie tabelas grandes, salvo pedido explícito.
+- Não explique conceitos básicos desnecessariamente nem faça introduções longas.
+- Priorize mudanças concretas e a justificativa principal; no máximo 3 mudanças principais.
+- Se não mudaria algo, diga isso diretamente.
+- Não termine oferecendo análises adicionais nem use frases genéricas.
+- Não invente dados ausentes; se houver dor, lesão ou sintomas importantes, recomende avaliação profissional.
+Exemplo: "Você mudaria algum exercício?" Responda com até três trocas objetivas e diga o que manteria, sem analisar todo o volume semanal.'''
+SIZE_INSTRUCTIONS = {
+    'short': 'Responda em até cerca de 150 palavras; perguntas simples em menos de 100.',
+    'normal': 'Responda em até cerca de 250 palavras; perguntas simples em menos de 100.',
+    'detailed': 'Responda em até cerca de 600 palavras, mas apenas com detalhes relevantes à pergunta.'
+}
+MARKDOWN_TAGS = ['p','br','strong','em','code','pre','ul','ol','li','blockquote','h2','h3','h4','a','hr','table','thead','tbody','tr','th','td']
+def render_answer(value):
+    html = markdown.markdown(value, extensions=['extra', 'sane_lists'])
+    return bleach.clean(html, tags=MARKDOWN_TAGS, attributes={'a':['href','title']}, strip=True)
+
+def response_size(c):
+    row=one(c.execute("SELECT value FROM app_settings WHERE key='ai_response_size'"))
+    return row['value'] if row and row['value'] in RESPONSE_LIMITS else 'short'
+
+def requested_details(question):
+    return bool(re.search(r'\b(?:detalhadamente|detalhad[ao]s?|em detalhes|an[aá]lise detalhada)\b', question.casefold()))
+
+def resolve_context(c, question, scope, weekday, exercise_id):
+    # A question about a named day narrows a selected weekly context.
+    if scope == 'week':
+        q=question.casefold()
+        days = [i for i, day in enumerate(DAYS) if re.search(r'\b'+re.escape(day.casefold())+r'(?:-feira)?\b', q)]
+        if len(days)==1 and not re.search(r'\b(?:semana|semanal|divis[aã]o semanal)\b',q):
+            scope,weekday='day',days[0]
+        else:
+            names=rows(c.execute('SELECT id,name FROM exercises ORDER BY LENGTH(name) DESC'))
+            matches=[e for e in names if e['name'].casefold() in q]
+            progression=bool(re.search(r'\b(?:evolu\w*|progres\w*|hist[oó]ri\w*)',q))
+            if not matches and progression:
+                words=[w for w in re.findall(r'\w+',q) if len(w)>=5]
+                matches=[e for e in names if any(w in e['name'].casefold().split() for w in words)]
+            if matches and len(matches)<=3:
+                if progression:
+                    return '\n\n'.join(build_context(c,'exercise',exercise_id=e['id']) for e in matches)[:12000]
+                ids=[e['id'] for e in matches]
+                placeholders=','.join('?' for _ in ids)
+                related=rows(c.execute(f'SELECT DISTINCT w.weekday FROM workouts w JOIN workout_exercises we ON we.workout_id=w.id WHERE we.exercise_id IN ({placeholders}) ORDER BY w.weekday',ids))
+                if related:
+                    return '\n\n'.join(build_context(c,'day',weekday=w['weekday']) for w in related)[:12000]
+    return build_context(c,scope,weekday,exercise_id)
 class AskIn(BaseModel):
     question: str = Field(min_length=1,max_length=2000)
     scope: Literal['week','day','exercise']
@@ -319,15 +378,19 @@ async def ask(b:AskIn):
     key=os.getenv('GROQ_API_KEY','')
     if not key: raise HTTPException(503,'Configure GROQ_API_KEY no .env')
     with conn() as c:
-        context=build_context(c,b.scope,b.weekday,b.exercise_id)
         question=b.question.strip()
-        digest=hashlib.sha256(json.dumps([context,question,MODEL],ensure_ascii=False).encode()).hexdigest()
+        context=resolve_context(c,question,b.scope,b.weekday,b.exercise_id)
+        size='detailed' if requested_details(question) else response_size(c)
+        token_limit=RESPONSE_LIMITS[size]
+        digest=hashlib.sha256(json.dumps([context,question,MODEL,size,token_limit,'concise-v2'],ensure_ascii=False).encode()).hexdigest()
         if not b.fresh:
             cached=one(c.execute('SELECT response FROM ai_requests WHERE context_hash=? ORDER BY id DESC LIMIT 1',(digest,)))
             if cached:
                 c.execute('INSERT INTO ai_requests(created_at,model,question,context_hash,cached,response) VALUES(?,?,?,?,1,?)',(now(),MODEL,question,digest,cached['response']))
-                return {'answer':cached['response'],'cached':True,'context':context}
-    payload={'model':MODEL,'messages':[{'role':'system','content':SYSTEM},{'role':'user','content':f'DADOS:\n{context}\n\nPERGUNTA:\n{question}'}],'temperature':0.35,'max_tokens':900}
+                return {'answer':cached['response'],'answer_html':render_answer(cached['response']),'cached':True,'context':context,'response_size':size}
+    payload={'model':MODEL,'messages':[{'role':'system','content':SYSTEM+'\n'+SIZE_INSTRUCTIONS[size]},{'role':'user','content':f'DADOS:\n{context}\n\nPERGUNTA:\n{question}'}],'temperature':0.35,'max_completion_tokens':token_limit}
+    if MODEL in ('openai/gpt-oss-120b','openai/gpt-oss-20b'):
+        payload['reasoning_effort']='low'
     try:
         async with httpx.AsyncClient(timeout=35) as client:
             response=await client.post('https://api.groq.com/openai/v1/chat/completions',headers={'Authorization':'Bearer '+key},json=payload)
@@ -342,10 +405,10 @@ async def ask(b:AskIn):
         raise HTTPException(502,'Falha ao consultar Groq. Tente novamente.')
     with conn() as c:
         c.execute('INSERT INTO ai_requests(created_at,model,question,context_hash,prompt_tokens,completion_tokens,total_tokens,cached,response) VALUES(?,?,?,?,?,?,?,?,?)',(now(),MODEL,question,digest,usage.get('prompt_tokens',0),usage.get('completion_tokens',0),usage.get('total_tokens',0),0,answer))
-    return {'answer':answer,'cached':False,'context':context}
+    return {'answer':answer,'answer_html':render_answer(answer),'cached':False,'context':context,'response_size':size,'truncated':data['choices'][0].get('finish_reason')=='length'}
 @app.get('/api/ai/context')
-def ai_context(scope:Literal['week','day','exercise'],weekday:int|None=None,exercise_id:int|None=None):
-    with conn() as c: return {'context':build_context(c,scope,weekday,exercise_id)}
+def ai_context(scope:Literal['week','day','exercise'],weekday:int|None=None,exercise_id:int|None=None,question:str=''):
+    with conn() as c: return {'context':resolve_context(c,question[:2000],scope,weekday,exercise_id)}
 @app.get('/api/ai/usage')
 def ai_usage():
     today=date.today().isoformat(); month=today[:7]
@@ -356,7 +419,16 @@ def ai_usage():
             return r
         return {'today':aggregate(today),'month':aggregate(month),'recent':items}
 @app.get('/api/settings')
-def settings(): return {'groq_configured':bool(os.getenv('GROQ_API_KEY')),'model':MODEL,'auth_enabled':AUTH}
+def settings():
+    with conn() as c: size=response_size(c)
+    return {'groq_configured':bool(os.getenv('GROQ_API_KEY')),'model':MODEL,'auth_enabled':AUTH,'ai_response_size':size,'normal_max_tokens':NORMAL_MAX_TOKENS}
+class SettingsIn(BaseModel):
+    ai_response_size: Literal['short','normal','detailed']
+@app.put('/api/settings')
+def update_settings(b:SettingsIn):
+    with conn() as c:
+        c.execute("INSERT INTO app_settings(key,value) VALUES('ai_response_size',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(b.ai_response_size,))
+    return {'ai_response_size':b.ai_response_size}
 @app.post('/api/ai/test')
 async def test_groq():
     key=os.getenv('GROQ_API_KEY','')
