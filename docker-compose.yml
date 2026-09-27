@@ -1,0 +1,12 @@
+services:
+  gymai:
+    build: .
+    ports:
+      - "8085:8000"
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - .env
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
